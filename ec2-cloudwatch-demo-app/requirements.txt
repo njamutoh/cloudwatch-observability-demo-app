@@ -1,0 +1,2 @@
+Flask>=3.0,<4
+aws-xray-sdk>=2.14,<3
