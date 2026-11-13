@@ -1,81 +1,254 @@
-# EC2 + CloudWatch observability practice app
 
-A **single Python application** for demonstrating AWS CloudWatch metrics, Logs, dashboards, alarms, and AWS X-Ray traces. **No Docker, setup scripts, systemd unit, dashboards-as-code, or monitoring configuration** is included. Configure AWS services manually in the console during your lab.
+# Northstar Shop — AWS Observability Lab
 
-## Run on EC2
+A small Flask application running on Amazon EC2, built to demonstrate three practical observability scenarios:
 
-Use Amazon Linux 2023 (or another machine with Python 3.9+). From your EC2 SSH terminal, after installing Python and Git:
+- **Logs:** Investigate HTTP 503 application errors using CloudWatch Logs.
+- **Metrics:** Generate a CPU utilization spike and observe it in CloudWatch.
+- **Traces:** Investigate slow application requests using AWS X-Ray.
+
+All commands run on EC2 unless otherwise specified.
+
+## 1. Launch EC2 and Run the Application
+
+Launch an **Amazon Linux 2023** EC2 instance.
+
+- Allow SSH (port 22) from your IP address only.
+- Attach an IAM role with `AmazonSSMManagedInstanceCore` and `CloudWatchAgentServerPolicy`.
+- Keep port 8000 private. The demo-control endpoints do not require authentication.
+
+### Install dependencies and clone the repository
+
+```bash
+sudo dnf install -y git python3 stress-ng
+
+git clone https://github.com/njamutoh/cloudwatch-observability-demo-app.git
+
+cd cloudwatch-observability-demo-app/ec2-cloudwatch-demo-app
+```
+
+### Create and activate the Python environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-export DEMO_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m pip install -r requirements.txt
 python app.py
 ```
 
-Keep that terminal open while running the lab. The application listens on **EC2 localhost port 8000**, intentionally not exposed to the public Internet.
+Leave this terminal running.
 
-From a **separate terminal on your local RHEL VM**, create an SSH tunnel to EC2 (replace placeholders):
+### Verify the application
 
-```bash
-ssh -i /path/to/key.pem -L 8000:127.0.0.1:8000 ec2-user@EC2_PUBLIC_IP
-```
-
-Run all `curl` commands below on the **local RHEL VM**. For the three control commands, replace `YOUR_TOKEN` with the `DEMO_TOKEN` printed or saved privately on EC2; do not show the token to the audience or commit it to Git.
-
-## Reproduce the live incident
+Open another EC2 terminal:
 
 ```bash
-# Baseline: success (HTTP 200)
-curl -i http://127.0.0.1:8000/checkout
+cd ~/cloudwatch-observability-demo-app/ec2-cloudwatch-demo-app
 
-# Generate some baseline requests
-for i in {1..30}; do curl -s -o /dev/null http://127.0.0.1:8000/checkout; sleep 0.2; done
-
-# Introduce application errors (HTTP 503)
-curl -s -X POST -H 'X-Demo-Token: YOUR_TOKEN' http://127.0.0.1:8000/control/fail
-for i in {1..50}; do curl -s -o /dev/null http://127.0.0.1:8000/checkout; sleep 0.2; done
-
-# Recover and verify HTTP 200
-curl -s -X POST -H 'X-Demo-Token: YOUR_TOKEN' http://127.0.0.1:8000/control/recover
+curl -i http://127.0.0.1:8000/health
 curl -i http://127.0.0.1:8000/checkout
 ```
 
-Optional slow request demo (about 1.5 seconds per checkout):
+Both should return HTTP 200 under normal conditions.
+
+### Access the application from your local Linux machine
+
+Create an SSH tunnel (replace the placeholders):
 
 ```bash
-curl -s -X POST -H 'X-Demo-Token: YOUR_TOKEN' http://127.0.0.1:8000/control/slow
-curl -w '\nTotal seconds: %{time_total}\n' -s http://127.0.0.1:8000/checkout
-curl -s -X POST -H 'X-Demo-Token: YOUR_TOKEN' http://127.0.0.1:8000/control/recover
+ssh -i /path/to/key.pem \
+  -L 8000:127.0.0.1:8000 \
+  ec2-user@EC2_PUBLIC_IP
 ```
 
-## What to configure manually in AWS
+Open `http://127.0.0.1:8000/` in your local browser while the tunnel is running.
 
-1. **EC2 IAM role** with permissions for CloudWatch Logs/metrics and X-Ray; for a teaching lab, AWS's `CloudWatchAgentServerPolicy` and `AWSXRayDaemonWriteAccess` managed policies are a practical starting point. Apply least privilege for production.
-2. **CloudWatch Agent** on EC2: install it manually (via Systems Manager or SSH), configure log collection from the absolute path of `app.log`, and turn on the **X-Ray traces receiver** if using the built-in X-Ray SDK. X-Ray's SDK emits segments to local UDP port 2000; without a configured receiver, traces will **not** reach AWS. No OpenTelemetry packages are required in the app.
-3. **CloudWatch Logs**: confirm that each `/checkout` request produces JSON events. The JSON includes **Embedded Metric Format (EMF)**: the `ObservabilityDemo` namespace exposes `RequestCount`, `ErrorCount`, and `LatencyMs` when the logs are successfully ingested. Note that collecting logs is not the same as automatically extracting metrics—EMF requires recognized ingestion through CloudWatch Logs.
-4. **CloudWatch Metrics / Dashboard**: add graphs for those custom metrics alongside the built-in EC2 `CPUUtilization` metric. A low-load demo may show little EC2 CPU activity; the application error metric is the primary incident signal.
-5. **CloudWatch Alarm + SNS**: create an alarm on the **sum of `ErrorCount`**, such as >= 3 errors in one 60-second period, with `Treat missing data as not breaching`; attach an SNS topic with a **confirmed** email subscription. Threshold and alarm evaluation timing determine when email arrives.
-6. **X-Ray**: after traces are arriving, inspect the checkout request traces and the `checkout-business-logic` subsegment. X-Ray SDK Python is in maintenance mode; this is a minimal educational demonstration rather than a recommended new production architecture.
+---
 
-### Operational notes
+## 2. Logs — Simulate HTTP 503 Errors
 
-- The app logs to `app.log` in the directory where it was started. Use the **absolute path** when configuring CloudWatch Agent.
-- `/health` remains OK when checkout errors are simulated. This deliberately distinguishes **process availability** from **user-facing application functionality**.
-- The `/control/*` endpoints require `DEMO_TOKEN`, and the Flask server is bound to localhost. Never expose Flask's development server publicly.
-- The sample traffic is modest and should only be run on infrastructure you control.
-- No Auto Scaling Group is deployed. Discuss self-healing and capacity scaling **theoretically** with your diagram.
+### Configure CloudWatch Logs
 
-## Graphical web interface
+In **CloudWatch → Configure CloudWatch Agent**, select the EC2 instance and install/configure the agent through Systems Manager.
 
-Open **http://127.0.0.1:8000/** in a browser on your local RHEL VM **after starting the SSH tunnel**. You'll see a fictional Northstar Shop checkout page with a **Complete demo checkout** button, live status indicator, HTTP result, and observed response time.
+SSM Agent must be connected before using the console installation workflow.
 
-- The button calls the existing `GET /checkout` endpoint. Normal operation displays a green successful checkout (HTTP 200).
-- Use the protected `POST /control/fail` terminal command above and click checkout again: the page visibly fails (HTTP 503), while the app emits the same CloudWatch EMF metrics, JSON logs, and X-Ray segments.
-- Use `POST /control/slow` for a visibly delayed checkout; recover with `POST /control/recover`.
-- The webpage has **no failure-mode admin buttons**: the presenter controls incidents privately from a terminal.
-- The UI uses bundled HTML/CSS/JavaScript only. No frontend frameworks, containers, CDN dependencies, or database.
-- `GET /status` provides the current simulation state for the on-screen indicator; `/health` intentionally continues to report process health even if checkout is failing.
+Configure log collection:
 
-**Note:** The in-browser request counter and latency are illustrative per-browser-session values, not CloudWatch metrics. The real `/checkout` calls independently generate telemetry for AWS.
+| Setting | Value |
+|---|---|
+| Log file | `/home/ec2-user/cloudwatch-observability-demo-app/ec2-cloudwatch-demo-app/app.log` |
+| Log group | `/aws/ec2/demowatch` |
+| Log stream | `{instance_id}` |
+| Include/exclude filters | Leave empty |
+
+Deploy the configuration.
+
+Check agent status if needed:
+
+```bash
+sudo systemctl is-active amazon-ssm-agent
+sudo systemctl is-active amazon-cloudwatch-agent
+```
+
+### Generate 10 HTTP 503 errors
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/control/fail
+
+for i in {1..10}; do
+  curl -s -o /dev/null -w 'HTTP %{http_code}\n' \
+    http://127.0.0.1:8000/checkout
+done
+```
+
+### Investigate errors locally
+
+```bash
+grep '"level":"ERROR"' app.log | tail -n 10
+```
+
+To monitor new errors in real time:
+
+```bash
+tail -n 0 -F app.log | grep --line-buffered '"level":"ERROR"'
+```
+
+### Investigate using CloudWatch
+
+Navigate to:
+
+**CloudWatch → Logs → Log groups → `/aws/ec2/demowatch`**
+
+Alternatively, run this CloudWatch Logs Insights query:
+
+```sql
+fields @timestamp, level, status, message
+| filter status = 503
+| sort @timestamp desc
+| limit 20
+```
+
+CloudWatch logs may take a little longer to appear than local application logs.
+
+### Restore the application
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/control/recover
+```
+
+---
+
+## 3. Metrics — Generate a CPU Utilization Spike
+
+### Configure EC2 monitoring
+
+Enable **EC2 Detailed Monitoring** to get one-minute CPU utilization datapoints.
+
+We'll use the built-in `CPUUtilization` metric rather than creating custom application metrics.
+
+### Generate high CPU utilization
+
+```bash
+stress-ng --cpu 2 --cpu-load 100 --timeout 2m --metrics-brief
+```
+
+This stresses both vCPUs for two minutes.
+
+### Observe CPU usage immediately
+
+Open another EC2 terminal:
+
+```bash
+top
+```
+
+### Investigate using CloudWatch
+
+Navigate to:
+
+**EC2 → Instances → Monitoring → CPU Utilization**
+
+Use:
+
+- Time range: **1 hour**
+- Period: **1 minute** (with detailed monitoring)
+- Statistic: **Average**
+
+CloudWatch metrics are not instantaneous. The CPU load appears locally before the updated metric becomes visible in the AWS Console.
+
+---
+
+## 4. Traces — Investigate a Slow Checkout
+
+### Configure AWS X-Ray
+
+In your CloudWatch Agent configuration, enable **AWS X-Ray traces** and deploy.
+
+Keep the default X-Ray receiver:
+
+```text
+127.0.0.1:2000 (UDP)
+```
+
+Port 8000 serves the Flask application. Port 2000 receives its X-Ray trace segments.
+
+Verify the listener:
+
+```bash
+sudo ss -lunp | grep ':2000'
+```
+
+### Generate five slow requests
+
+```bash
+# Reset the application
+curl -s -X POST http://127.0.0.1:8000/control/recover
+
+# Enable slow responses
+curl -s -X POST http://127.0.0.1:8000/control/slow
+
+# Generate five slow requests
+for i in {1..5}; do
+  curl -s -o /dev/null \
+    -w 'HTTP %{http_code} | Time: %{time_total}s\n' \
+    http://127.0.0.1:8000/checkout
+done
+```
+
+Each request should take approximately **1.5 seconds**.
+
+### Investigate using AWS X-Ray
+
+Navigate to:
+
+**CloudWatch → X-Ray traces → Traces**
+
+Select a recent `GET /checkout` trace.
+
+Inspect:
+
+- HTTP response code: `200`
+- Request duration: approximately `1.5s`
+- The `checkout-business-logic` subsegment
+- Trace details and raw data
+
+This demonstrates that an HTTP 200 response doesn't necessarily mean the user experienced good performance.
+
+### Restore normal response times
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/control/recover
+```
+
+---
+
+## 5. Cleanup
+
+Stop the Flask application with `Ctrl+C`.
+
+When finished, terminate the demo EC2 instance and remove unused CloudWatch resources to avoid unnecessary charges.
+
+---
+
+**That's the lab:** introduce a problem, observe its symptoms, investigate the evidence, and restore normal operation.
